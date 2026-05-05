@@ -7,30 +7,51 @@ package com.example.disruptor;
  * 1. 大小必须是 2 的幂，通过位掩码（& indexMask）代替取模，速度极快
  * 2. 启动时预分配所有事件对象，运行期只更新对象字段，不产生 GC
  * 3. 生产者通过 next/publish 写入，消费者通过 get(sequence) 读取
+ *
+ * 伪共享防护（False Sharing），照搬真实 Disruptor 源码的两层设计：
+ *
+ * 第一层：继承 RingBufferPad（56 byte 前置填充）+ RingBuffer 末尾 56 byte 后置填充，
+ * 将 entries/indexMask 等热字段夹在两段填充之间，与对象头和相邻对象隔离到独立缓存行。
+ *
+ * 第二层：entries 数组申请 bufferSize + 2*BUFFER_PAD 个槽，实际数据从 BUFFER_PAD 偏移开始存放。
+ * 这样数组头部（对象头 + length 字段）和尾部都有 32 个空槽作为缓冲，
+ * 防止数组首尾元素与数组元数据或相邻堆对象产生伪共享。
  */
-public class RingBuffer<E> {
+public final class RingBuffer<E> extends RingBufferPad {
 
-    /** 前置填充：防止 entries 数组头部与其他字段产生伪共享 */
-    protected long p1, p2, p3, p4, p5, p6, p7;
+    private static final int BUFFER_PAD = 32;
 
+    private final long indexMask;
     private final Object[] entries;
     private final int bufferSize;
-    private final int indexMask;  // bufferSize - 1，用于位运算快速取模
-
-    /** 后置填充 */
-    protected long p9, p10, p11, p12, p13, p14, p15;
-
     private final Sequencer sequencer;
+
+    /** 后置填充：与前置填充共同将上方字段包夹在独立缓存行中 */
+    protected byte
+        p10, p11, p12, p13, p14, p15, p16, p17,
+        p20, p21, p22, p23, p24, p25, p26, p27,
+        p30, p31, p32, p33, p34, p35, p36, p37,
+        p40, p41, p42, p43, p44, p45, p46, p47,
+        p50, p51, p52, p53, p54, p55, p56, p57,
+        p60, p61, p62, p63, p64, p65, p66, p67,
+        p70, p71, p72, p73, p74, p75, p76, p77;
 
     @SuppressWarnings("unchecked")
     private RingBuffer(EventFactory<E> factory, Sequencer sequencer) {
         this.sequencer = sequencer;
         this.bufferSize = sequencer.getBufferSize();
+        if (bufferSize < 1) {
+            throw new IllegalArgumentException("bufferSize must not be less than 1");
+        }
+        if (Integer.bitCount(bufferSize) != 1) {
+            throw new IllegalArgumentException("bufferSize must be a power of 2");
+        }
         this.indexMask = bufferSize - 1;
-        this.entries = new Object[bufferSize];
-        // 预分配：填满所有槽位，后续只复用这些对象
+        // 数组多申请 2*BUFFER_PAD 个槽，实际元素从 BUFFER_PAD 偏移开始存放，
+        // 使数组首尾各有 32 个空槽，防止首尾元素与数组元数据产生伪共享
+        this.entries = new Object[bufferSize + 2 * BUFFER_PAD];
         for (int i = 0; i < bufferSize; i++) {
-            entries[i] = factory.newInstance();
+            entries[BUFFER_PAD + i] = factory.newInstance();
         }
     }
 
@@ -45,8 +66,7 @@ public class RingBuffer<E> {
      */
     @SuppressWarnings("unchecked")
     public E get(long sequence) {
-        // sequence & indexMask 等价于 sequence % bufferSize，但快得多
-        return (E) entries[(int) (sequence & indexMask)];
+        return (E) entries[BUFFER_PAD + (int) (sequence & indexMask)];
     }
 
     /**

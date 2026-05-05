@@ -1,40 +1,31 @@
 package com.example.disruptor;
 
-import sun.misc.Unsafe;
-
-import java.lang.reflect.Field;
+import java.lang.invoke.MethodHandles;
+import java.lang.invoke.VarHandle;
 
 /**
  * 带缓存行填充的原子序号，消除伪共享（False Sharing）。
  *
- * CPU 缓存行通常 64 字节。若两个变量落在同一缓存行，
- * 一个线程写入会导致另一线程的缓存行失效，造成不必要的缓存同步。
+ * 填充结构：LhsPadding(56B) -> value(8B) -> RhsPadding(56B)
+ * value 字段被前后各 56 字节的 byte 填充包夹，独占一条 64 字节缓存行。
+ * 使用继承层级而非同类字段，保证 JVM 不会消除填充。
  *
- * 填充方式：前 7 个 long（56字节）+ value（8字节）+ 后 7 个 long（56字节）
- * 确保 value 独占一条缓存行。
+ * 内存语义使用 VarHandle（JDK 9+），替代 Unsafe：
+ * - get(): acquire 读（对应 volatile read）
+ * - set(): release 写（store-store 屏障，比 volatile 写弱，避免 full fence）
+ * - setVolatile(): release + full fence（完整 volatile 写）
  */
-public class Sequence {
-
-    // value 前面的填充，占满 56 字节
-    protected long p1, p2, p3, p4, p5, p6, p7;
-
-    private volatile long value;
-
-    // value 后面的填充，防止与后续字段共享缓存行
-    protected long p9, p10, p11, p12, p13, p14, p15;
+public class Sequence extends RhsPadding {
 
     static final long INITIAL_VALUE = -1L;
 
-    private static final Unsafe UNSAFE;
-    private static final long VALUE_OFFSET;
+    private static final VarHandle VALUE_FIELD;
 
     static {
         try {
-            Field f = Unsafe.class.getDeclaredField("theUnsafe");
-            f.setAccessible(true);
-            UNSAFE = (Unsafe) f.get(null);
-            VALUE_OFFSET = UNSAFE.objectFieldOffset(Sequence.class.getDeclaredField("value"));
-        } catch (Exception e) {
+            VALUE_FIELD = MethodHandles.lookup().in(Sequence.class)
+                    .findVarHandle(Sequence.class, "value", long.class);
+        } catch (final Exception e) {
             throw new RuntimeException(e);
         }
     }
@@ -44,24 +35,29 @@ public class Sequence {
     }
 
     public Sequence(long initialValue) {
-        UNSAFE.putOrderedLong(this, VALUE_OFFSET, initialValue);
+        VarHandle.releaseFence();
+        this.value = initialValue;
     }
 
     public long get() {
-        return value;
+        long v = this.value;
+        VarHandle.acquireFence();
+        return v;
     }
 
     public void set(long value) {
-        // putOrderedLong：store-store 屏障，比 volatile 写弱但避免 full fence，性能更好
-        UNSAFE.putOrderedLong(this, VALUE_OFFSET, value);
+        VarHandle.releaseFence();
+        this.value = value;
     }
 
     public void setVolatile(long value) {
-        UNSAFE.putLongVolatile(this, VALUE_OFFSET, value);
+        VarHandle.releaseFence();
+        this.value = value;
+        VarHandle.fullFence();
     }
 
     public boolean compareAndSet(long expectedValue, long newValue) {
-        return UNSAFE.compareAndSwapLong(this, VALUE_OFFSET, expectedValue, newValue);
+        return VALUE_FIELD.compareAndSet(this, expectedValue, newValue);
     }
 
     public long incrementAndGet() {
@@ -69,13 +65,7 @@ public class Sequence {
     }
 
     public long addAndGet(long increment) {
-        long currentValue;
-        long newValue;
-        do {
-            currentValue = get();
-            newValue = currentValue + increment;
-        } while (!compareAndSet(currentValue, newValue));
-        return newValue;
+        return (long) VALUE_FIELD.getAndAdd(this, increment) + increment;
     }
 
     @Override
