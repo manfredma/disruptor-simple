@@ -1,9 +1,11 @@
 package com.example.disruptor;
 
 /**
- * 前置填充：56 个 byte，使 RingBufferFields 中的字段与对象头分隔在不同缓存行。
- * 使用 byte 而非 long：更精确控制填充字节数（不受 long 对齐约束影响）。
- * 使用继承层级：JVM 保证父类字段优先于子类字段布局，不会被优化消除。
+ * 前置填充：56 个 byte，目的是将子类字段推离对象头所在的缓存行。
+ * 使用 byte 而非 long：精确控制填充字节数，不受 long 8 字节对齐约束影响。
+ * 使用继承层级：JVM 保证父类字段先于子类字段布局，不会被优化消除。
+ * 局限：JVM 将同类型字段聚集、引用字段排最后，byte 填充无法将引用类型字段
+ * 真正包夹在两段填充之间。对 RingBuffer 而言真正有效的防护是数组内部的 BUFFER_PAD 偏移。
  */
 abstract class RingBufferPad {
     protected byte
